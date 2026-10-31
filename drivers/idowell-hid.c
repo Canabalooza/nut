@@ -31,7 +31,10 @@
 #include "usb-common.h"
 #include "hidparser.h" /* for FindObject_with_ID_Node() */
 
-#define IDOWELL_HID_VERSION	"iDowell HID 0.24"
+#define IDOWELL_HID_VERSION	"iDowell HID 0.25"
+/* v0.25 GoldenMate: shrink the oversized RunTimeToEmpty copies whose high
+ *       bytes carry PresentStatus state (battery.runtime 599940 =
+ *       (0x09 << 16) + 10116), see idowell_fix_report_desc() */
 /* FIXME: experimental flag to be put in upsdrv_info */
 /* v0.24 GoldenMate: restore the Power Device page on the Good and
  *       ShutdownImminent PresentStatus bits, see idowell_fix_status_usage() */
@@ -342,6 +345,44 @@ static int idowell_fix_report_desc(HIDDevice_t *pDev, HIDDesc_t *pDesc_arg) {
 				(long)IDOWELL_VOLTAGE_LOGMAX);
 			retval++;
 		}
+	}
+
+	/* This firmware pads RunTimeToEmpty to 32 bits in both the Feature
+	 * 0x01 and the Input 0x02 copy, but only maintains 16 bits of it;
+	 * the high byte of each copy carries adjacent PresentStatus state
+	 * (e.g. 0x09 = ACPresent) which leaked into battery.runtime as
+	 * 599940 = (0x09 << 16) + 10116. The mapping reads whichever copy
+	 * the parser prefers, so shrink every oversized copy: the vendor
+	 * only ever tracks 16-bit seconds (<= 65535 s ~ 18 h).
+	 */
+	for (int rid = 0; rid < 2; rid++) {
+		const int report_id = (rid == 0) ? 0x01 : 0x02;
+
+		if ((pData = FindObject_with_ID_Node(pDesc_arg, report_id,
+		USAGE_BAT_RUN_TIME_TO_EMPTY)) == NULL) {
+			upsdebugx(3, "Report Descriptor fix: no RunTimeToEmpty "
+				"item found in ReportID 0x%02x", report_id);
+			continue;
+		}
+
+		upsdebugx(4, "Original Report Descriptor: RunTimeToEmpty "
+			"ReportID: 0x%02x, Offset: %d, Size: %d, "
+			"LogMin: %ld, LogMax: %ld",
+			report_id, (int)pData->Offset, (int)pData->Size,
+			pData->LogMin, pData->LogMax);
+
+		if (pData->Size <= 16) {
+			continue;
+		}
+
+		upsdebugx(3, "Fixing Report Descriptor: set RunTimeToEmpty "
+			"Size = 16 in ReportID 0x%02x (was %d: the high byte "
+			"of this field carries adjacent firmware state such "
+			"as the PresentStatus bitmap, which leaked into "
+			"battery.runtime)",
+			report_id, (int)pData->Size);
+		pData->Size = 16;
+		retval++;
 	}
 
 	retval += idowell_fix_status_usage(pDesc_arg,
