@@ -27,4 +27,11 @@
 
 extern subdriver_t idowell_subdriver;
 
+/* Companion hooks carrying the vendor status block quirk (see
+ * idowell-hid.c): some iDowell / GoldenMate firmware publishes live
+ * readings only in HID report windows that the Report Descriptor does
+ * not declare; this aux polls them and publishes what it can prove
+ * under experimental.idowell.* names. */
+extern subdriver_aux_t idowell_hid_aux_vendor_block;
+
 #endif /* IDOWELL_HID_H */

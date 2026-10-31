@@ -31,7 +31,10 @@
 #include "usb-common.h"
 #include "hidparser.h" /* for FindObject_with_ID_Node() */
 
-#define IDOWELL_HID_VERSION	"iDowell HID 0.25"
+#define IDOWELL_HID_VERSION	"iDowell HID 0.26"
+/* v0.26 GoldenMate: read the live status block that this firmware only
+ *       exposes through undeclared HID reports, through the
+ *       idowell_hid_aux_vendor_block hook set */
 /* v0.25 GoldenMate: shrink the oversized RunTimeToEmpty copies whose high
  *       bytes carry PresentStatus state (battery.runtime 599940 =
  *       (0x09 << 16) + 10116), see idowell_fix_report_desc() */
@@ -184,6 +187,10 @@ static int idowell_is_goldenmate(HIDDevice_t *hd)
 
 /* this function allows the subdriver to "claim" a device: return 1 if
  * the device is supported by this subdriver, else 0. */
+/* the device this subdriver won: VendorID/ProductID are needed by the
+ * vendor block quirk outside of claim() and fix_report_desc() */
+static HIDDevice_t		*idowell_claimed_dev;
+
 static int idowell_claim(HIDDevice_t *hd)
 {
 	int status = is_usb_device_supported(idowell_usb_device_table, hd);
@@ -204,6 +211,7 @@ static int idowell_claim(HIDDevice_t *hd)
 		if (hd->VendorID == PHOENIXTEC_VENDORID && !idowell_is_goldenmate(hd)) {
 			return 0;
 		}
+		idowell_claimed_dev = hd;
 		return 1;
 
 	case NOT_SUPPORTED:
@@ -393,6 +401,421 @@ static int idowell_fix_report_desc(HIDDevice_t *pDev, HIDDesc_t *pDesc_arg) {
 	return retval;
 }
 
+/* (2) Live readings that the Report Descriptor does not declare.
+ *
+ * This firmware answers GET_REPORT for report IDs that the descriptor does
+ * not declare (0x03..0x0f) with a 256 byte window into its RAM. One of those
+ * windows holds a fixed-width ASCII digit status line - observed online with
+ * the pack at 100 % on 2026-10-30, raw bytes:
+ *
+ *	99990900124010060022131000000000
+ *	(999.9 090.0 124.0 100 60.0 2.21 31.0 00000000 after decoding)
+ *
+ * which decodes as: vendor runtime field (999.9 while online), a constant
+ * 090.0 matching the low end of this model's spec input window (90-140 V,
+ * line-interactive AVR buck threshold, not a measured bus), output voltage
+ * (123.0 V; 119-120 while inverting; 000.0 when the outputs are dead),
+ * battery charge (100 %), AC input frequency (59.9 Hz, 00.0 while
+ * inverting), the pack voltage divided by a hardcoded 24 (per the vendor
+ * spec the pack is LiFePO4 16S, nominal 51.2 V, 9 Ah, 460.8 Wh: the figure
+ * scales back to 53.0 V at float and 40.1 V = 2.50 V/cell at the exact
+ * point the BMS cuts), and a temperature-like field (31.0 idle, up to
+ * 43.0 under load, matching the 0-40 C operating spec).
+ *
+ * The report ID acts as a window selector: the same page appears at ID 0x03
+ * and 0x07 (line at offset 76/149) and at 0x0b and 0x0f (shifted by 5 bytes),
+ * and is absent from the other IDs. So we scan a few IDs and anchor on the
+ * ASCII pattern rather than on a fixed report ID or byte offset, and remember
+ * which ID worked last.
+ *
+ * This block matters operationally: it is the only place where a dead output
+ * is visible. When the pack cut out under load with the wall still unplugged,
+ * the output field read 000.0 here while ups.status wrongly stayed OL.
+ */
+/* Report IDs that were seen to answer with the RAM window holding the line */
+static const int	idowell_vendor_block_ids[] = { 0x03, 0x07, 0x0b, 0x0f };
+static int		idowell_vendor_block_lastid = -1;
+static int		idowell_vendor_block_fails = 0;
+
+#define IDOWELL_VB_BUFLEN	256
+#define IDOWELL_VB_LINELEN	96
+
+#ifndef ARRAY_SIZE
+#define ARRAY_SIZE(x)		((sizeof x) / (sizeof *x))
+#endif
+#define IDOWELL_VB_NONE			0
+#define IDOWELL_VB_OK			(1 << 0)
+#define IDOWELL_VB_OUTPUT_DEAD		(1 << 1)
+
+static int		idowell_vendor_block_enabled = 0;
+static int		idowell_vendor_block_amend_status = 0;
+static int		idowell_vb_fell_back_output = 0;
+static int		idowell_vb_fell_back_freq = 0;
+
+/* Is this a device whose firmware needs the status block poll?
+ * Cached, and switched off by the disable_idowell_vendor_block driver option. */
+static int idowell_vendor_block_applies(HIDDevice_t *hd)
+{
+	static	int		known = -1;
+
+	if (known < 0) {
+		known = 0;
+		if (hd != NULL
+		&&  is_usb_device_supported(idowell_usb_device_table, hd) == SUPPORTED
+		&&  !testvar("disable_idowell_vendor_block")
+		) {
+			/* The RAM-window status block, its tuple layout and the
+			 * pack-voltage divisor of 24 are only proven on the
+			 * 075d:0300 family (1000W/1200W/1600W models, all with
+			 * vendor spec 51.2 V packs, all reporting the same 2.2
+			 * scale figure per NUT issues #3556/#3015). Other IDs
+			 * handled by this subdriver, e.g. 06da:ffff (25.6 V
+			 * 8S packs per vendor spec), may share the firmware
+			 * family but not this block's layout or divisor - see
+			 * their descriptor Voltage figure of 13.2 in issue
+			 * #3501 which on a 25.6 V pack implies a different
+			 * scale. So default to 075d:0300 only; anything else
+			 * needs explicit opt-in via idowell_vendor_block_force. */
+			if (hd->VendorID == IDOWELL_VENDORID
+			&&  hd->ProductID == 0x0300) {
+				known = 1;
+			} else if (testvar("idowell_vendor_block_force")) {
+				known = 1;
+				upsdebugx(2, "%s: vendor status block polling "
+					"forced on an unverified device ID; "
+					"decoded fields (including the x24 "
+					"pack-voltage estimate) may be wrong",
+					__func__);
+			}
+			if (known == 1)
+				upsdebugx(2, "%s: will poll the vendor status "
+					"block (disable with the "
+					"disable_idowell_vendor_block option)",
+					__func__);
+		}
+	}
+
+	return known;
+}
+
+/* Vendor ups.conf options are offered through the aux hook set, so the
+ * generic usbhid-ups code needs no iDowell specifics (pattern established
+ * by ecoflow-hid-aux-cdc.c) */
+static void idowell_vendor_block_makevartable(void)
+{
+	addvar(VAR_FLAG, "disable_idowell_vendor_block",
+		"Do not poll the extra vendor status block that some iDowell "
+		"and GoldenMate firmware only exposes through undeclared HID "
+		"reports (raw GET_REPORT of a firmware RAM window)");
+
+	addvar(VAR_FLAG, "idowell_vendor_block_status",
+		"Let that vendor status block amend ups.status: when it "
+		"measures the outputs dead (0.0 V) although the device claims "
+		"to be online, report as on battery instead. This only ever "
+		"downgrades a claimed online state; default off as it amends "
+		"safety-relevant status based on an undeclared data source");
+
+	addvar(VAR_FLAG, "idowell_vendor_block_force",
+		"Poll and decode the vendor status block even on device IDs "
+		"whose block layout and pack voltage scaling are not verified "
+		"(decoded values may be nonsense there)");
+}
+
+static void idowell_vendor_block_initups(void)
+{
+	/* one-time decision, honoring the options above */
+	idowell_vendor_block_amend_status =
+		testvar("idowell_vendor_block_status") ? 1 : 0;
+	idowell_vendor_block_enabled =
+		idowell_vendor_block_applies(idowell_claimed_dev);
+}
+
+static int idowell_update_vendor_block(void)
+{
+	char		buf[IDOWELL_VB_BUFLEN];
+	char		line[IDOWELL_VB_LINELEN];
+	double		f1 = 0.0, f2 = 0.0, f3 = 0.0, f5 = 0.0, f6 = 0.0, f7 = 0.0;
+	int		f4 = 0, nfields = 0, n = 0, id = -1, i, p, rc = IDOWELL_VB_NONE;
+
+	/* try the report ID that worked last time, then sweep the known ones */
+	for (i = -1; i < (int)ARRAY_SIZE(idowell_vendor_block_ids); i++) {
+		int	try = (i < 0) ? idowell_vendor_block_lastid
+		              : idowell_vendor_block_ids[i];
+
+		if (try < 0 || try == id) {
+			continue;
+		}
+
+		n = HIDGetRawReport(udev, try, buf, (int)sizeof(buf));
+		if (n <= 0) {
+			continue;
+		}
+
+		for (p = 0; p < n; p++) {
+			int		run;
+
+			if (buf[p] < '0' || buf[p] > '9') {
+				continue;
+			}
+
+			/* measure the consecutive digit run */
+			for (run = 0; (p + run) < n
+			&&  buf[p + run] >= '0' && buf[p + run] <= '9'; run++) {}
+
+			if (run < 32) {
+				p += run;
+				continue;
+			}
+
+			/* Raw format (verified on-wire, digits only, no separators;
+			 * widths 4,4,4,3,3,3,3 then an 8 char flag word, with the
+			 * decimal points implied by width):
+			 *   9999 0900 1240 100 600 221 310 00000000
+			 *    f1   f2   f3  f4  f5  f6  f7  flag
+			 * Parse the fixed-width fields and rebuild a readable line. */
+			{
+				char	 fld[9];
+				long	 v1, v2, v3, c4, v5, v6, v7;
+
+				v1 = v2 = v3 = c4 = v5 = v6 = v7 = 0;
+
+#define IDOWELL_VB_GET(dst, off, len) \
+					do { \
+						memcpy(fld, &buf[p + (off)], (len)); \
+						fld[len] = '\0'; \
+						dst = strtol(fld, NULL, 10); \
+					} while (0)
+
+				IDOWELL_VB_GET(v1, 0, 4);
+				IDOWELL_VB_GET(v2, 4, 4);
+				IDOWELL_VB_GET(v3, 8, 4);
+				IDOWELL_VB_GET(c4, 12, 3);
+				IDOWELL_VB_GET(v5, 15, 3);
+				IDOWELL_VB_GET(v6, 18, 3);
+				IDOWELL_VB_GET(v7, 21, 3);
+#undef IDOWELL_VB_GET
+
+				f1 = (double)v1 / 10.0;
+				f2 = (double)v2 / 10.0;
+				f3 = (double)v3 / 10.0;
+				f4 = (int)c4;
+				f5 = (double)v5 / 10.0;
+				f6 = (double)v6 / 100.0;
+				f7 = (double)v7 / 10.0;
+				snprintf(line, sizeof(line),
+					"%.1f %.1f %.1f %03d %.1f %.2f %.1f %.*s",
+					f1, f2, f3, f4, f5, f6, f7,
+					8, &buf[p + 24]);
+
+				nfields = 7;
+			}
+
+			/* plausibility gate: charge is a percentage, output V is a
+			 * line voltage, bus V is positive; anything else means we
+			 * landed on unrelated RAM */
+			if (f4 >= 0 && f4 <= 100
+			&&  f2 > 0.0 && f2 < 1000.0
+			&&  f3 >= 0.0 && f3 < 300.0
+			) {
+				id = try;
+				break;
+			}
+			nfields = 0;
+			p += 31;
+		}
+
+		if (nfields >= 6) {
+			break;
+		}
+	}
+
+	if (nfields < 6) {
+		/* Do not keep publishing figures we can no longer confirm */
+		if (++idowell_vendor_block_fails >= 3) {
+			upsdebugx(2, "%s: vendor status block not readable for %d "
+				"polls in a row, dropping the variables it fed",
+				__func__, idowell_vendor_block_fails);
+			if (idowell_vb_fell_back_output) {
+				/* only delete the fallbacks we filled */
+				dstate_delinfo("output.voltage");
+				idowell_vb_fell_back_output = 0;
+			}
+			if (idowell_vb_fell_back_freq) {
+				dstate_delinfo("input.frequency");
+				idowell_vb_fell_back_freq = 0;
+			}
+			dstate_delinfo("experimental.idowell.battery.voltage.pack.estimated");
+			dstate_delinfo("experimental.idowell.status_block.input_frequency");
+			dstate_delinfo("experimental.idowell.status_block.output_voltage");
+			dstate_delinfo("experimental.idowell.status_block.runtime_field");
+			dstate_delinfo("experimental.idowell.status_block.temp_field");
+			dstate_delinfo("experimental.idowell.status_block.tuple");
+			dstate_delinfo("experimental.idowell.output.dead");
+		}
+		return rc;
+	}
+
+	idowell_vendor_block_fails = 0;
+	idowell_vendor_block_lastid = id;
+
+	upsdebugx(4, "%s: vendor status block (report 0x%02x): %s",
+		__func__, id, line);
+
+	/* The declared reports on this firmware DO provide output.voltage
+	 * and input.frequency - but they keep serving bypass values while
+	 * inverting (125.2 V / 60.0 Hz measured with the wall plug out and
+	 * the outputs cut to 0.0), so they are not to be trusted in
+	 * battery or dead-output states. We do not clobber declared-path
+	 * variables; the honest measurements from this block are published
+	 * under experimental.idowell.* names (docs/nut-names.txt rule for
+	 * unstandardized concepts), so they are cross-checkable. */
+	if (dstate_getinfo("output.voltage") == NULL) {
+		/* fill the standard name only when this firmware does not
+		 * serve it at all; declared copies must not be clobbered
+		 * here, and are never deleted from this file */
+		idowell_vb_fell_back_output = 1;
+		dstate_setinfo("output.voltage", "%.1f", f3);
+	}
+	if (dstate_getinfo("input.frequency") == NULL) {
+		idowell_vb_fell_back_freq = 1;
+		dstate_setinfo("input.frequency", "%.1f", f5);
+	}
+	dstate_setinfo("experimental.idowell.status_block.output_voltage", "%.1f", f3);
+	dstate_setinfo("experimental.idowell.status_block.input_frequency", "%.1f", f5);
+
+	/* Vendor spec for this model (UPS2000VA/1600W): LiFePO4,
+	 * nominal 51.2 V (16S), 9 Ah, 460.8 Wh. The per-cell-scale
+	 * figure f6 tracks real pack state when scaled x24: 2.21 ->
+	 * 53.0 V at float, and 1.67 -> 40.1 V = exactly the 2.50 V/cell
+	 * where the BMS cuts at end-of-discharge. Publish that as an
+	 * explicitly estimated pack voltage; the x24 divisor is
+	 * empirical (no multimeter on a mains-connected pack), so the
+	 * variable name says so. f2 is a constant 90.0 which matches
+	 * the low end of the spec 90-140 V input window (AVR buck
+	 * threshold), not any battery-side measurement. */
+	dstate_setinfo("experimental.idowell.battery.voltage.pack.estimated", "%.1f", f6 * 24.0);
+	dstate_setinfo("experimental.idowell.status_block.runtime_field", "%.1f", f1);
+	if (nfields >= 7) {
+		dstate_setinfo("experimental.idowell.status_block.temp_field", "%.1f", f7);
+	}
+	dstate_setinfo("experimental.idowell.status_block.tuple", "%s", line);
+
+	/* (3) Dead outputs are the state that NUT otherwise gets wrong here:
+	 * the PresentStatus bitmap keeps claiming ACPresent after the pack
+	 * cut out with the wall unplugged. Flag it always; letting it amend
+	 * ups.status is opt-in (see idowell_vendor_block_status). */
+	dstate_setinfo("experimental.idowell.output.dead", "%d", (f3 < 1.0) ? 1 : 0);
+	if (f3 < 1.0) {
+		rc |= IDOWELL_VB_OUTPUT_DEAD;
+	}
+
+	return rc | IDOWELL_VB_OK;
+}
+
+
+/* Amend the just-committed ups.status where the measurement disagrees
+ * with the PresentStatus bitmap: after the pack cut out with the wall
+ * unplugged, these firmwares keep asserting ACPresent while this block
+ * measures 0.0 V at the outputs. The aux updateinfo() hook runs right
+ * after the generic driver committed ups.status for this cycle, so
+ * rewrite that string to drop the OL claim and ensure OB. Only ever
+ * downgrades the power state, and is opt-in (idowell_vendor_block_status).
+ * Note the driver's own status-change logging then sees the amended
+ * value as its baseline for the next cycle.
+ */
+static void idowell_amend_status_string(void)
+{
+	const char	*cur = dstate_getinfo("ups.status");
+	char		buf[256];
+	size_t		len = 0;
+	int		online_seen = 0, battery_seen = 0;
+	const char	*token = cur;
+
+	if (cur == NULL) {
+		return;
+	}
+
+	while (*token != '\0' && len < sizeof(buf) - 4) {
+		const char	*end = token;
+
+		while (*end != '\0' && *end != ' ') {
+			end++;
+		}
+
+		if (end - token == 2 && !strncmp(token, "OL", 2)) {
+			online_seen = 1;
+		}
+		else {
+			if (end - token == 2 && !strncmp(token, "OB", 2)) {
+				battery_seen = 1;
+			}
+			memcpy(&buf[len], token, (size_t)(end - token));
+			len += (size_t)(end - token);
+			buf[len++] = ' ';
+		}
+
+		token = (*end != '\0') ? end + 1 : end;
+	}
+
+	if (!online_seen) {
+		/* the device already reports OB or bypass states: nothing
+		 * to correct */
+		return;
+	}
+
+	if (!battery_seen) {
+		memmove(&buf[1], buf, len);
+		buf[0] = 'O';
+		buf[1] = 'B';
+		len += 2;
+	}
+	buf[len] = '\0';
+
+	upsdebugx(2, "%s: the vendor status block measured 0.0 V on the "
+		"outputs although the device claims to be online: amending "
+		"ups.status from '%s' to '%s'",
+		__func__, cur, buf);
+
+	dstate_setinfo("ups.status", "%s", buf);
+}
+
+static void idowell_vendor_block_updateinfo(void)
+{
+	int	vb;
+
+	if (!idowell_vendor_block_enabled) {
+		return;
+	}
+
+	vb = idowell_update_vendor_block();
+
+	if (!(vb & IDOWELL_VB_OK)) {
+		return;
+	}
+
+	/* Measured 0.0 V on the outputs: the firmware starts serving canned
+	 * online-era figures (battery.runtime jumps to 10800..14400 seconds
+	 * of remaining runtime with the outlets already dead). Remaining
+	 * runtime behind dead outputs is zero, and a dead output must not
+	 * leave ups.status claiming OL. Both amendments are gated on the
+	 * opt-in idowell_vendor_block_status option.
+	 */
+	if (idowell_vendor_block_amend_status && (vb & IDOWELL_VB_OUTPUT_DEAD)) {
+		dstate_setinfo("battery.runtime", "0");
+		idowell_amend_status_string();
+	}
+}
+
+/* The quirk plugs into the generic polling cycle through this hook set
+ * (subdriver_aux_t, see usbhid-ups.h) */
+subdriver_aux_t idowell_hid_aux_vendor_block = {
+	idowell_vendor_block_makevartable,
+	idowell_vendor_block_initups,
+	NULL,	/* initinfo: nothing to add */
+	idowell_vendor_block_updateinfo,
+	NULL,	/* cleanup: nothing persistent to release */
+};
+
 subdriver_t idowell_subdriver = {
 	IDOWELL_HID_VERSION,
 	idowell_claim,
@@ -402,5 +825,5 @@ subdriver_t idowell_subdriver = {
 	idowell_format_mfr,
 	idowell_format_serial,
 	idowell_fix_report_desc,
-	NULL,
+	&idowell_hid_aux_vendor_block,
 };

@@ -240,6 +240,33 @@ It is also always possible that NUT fix-ups cause issues on some devices,
 whether due to NUT bugs or because the vendor protocol implementation is
 broken in more than one place.
 
+*disable_idowell_vendor_block*::
+Set to skip polling the extra vendor status block which some
+`iDowell`/`GoldenMate` devices only publish through undeclared HID reports
+(over-read of the firmware RAM window). By default this polling applies
+only to device IDs whose block layout was verified in the field
+(currently `075d:0300`); it publishes cross-check telemetry under
+`experimental.idowell.*` names, including a pack voltage estimate and the
+`experimental.idowell.output.dead` flag (measured output voltage zero
+while the device otherwise keeps serving online-era figures).
+
+*idowell_vendor_block_status*::
+Set to let the above vendor status block amend `ups.status`: if it
+measures the outputs dead (0.0 V) although the device claims to be
+online, the driver rewrites the committed `ups.status` to drop the `OL`
+claim and assert `OB` instead.
+This only ever downgrades a claimed online state to battery power; it
+cannot make the device appear online or initiate shutdowns by itself.
+Default is off because it amends safety-relevant status based on an
+undeclared vendor data source.
+
+*idowell_vendor_block_force*::
+Set to poll and decode the vendor status block even on
+`iDowell`/`GoldenMate` device IDs whose block layout and voltage scaling
+are not yet verified (other vendors in the same family may use different
+pack scaling, so decoded values could be nonsense there). The
+`RunTimeToEmpty` report descriptor fix-ups apply regardless, family-wide.
+
 *powercom_sdcmd_byte_order_fallback*::
 Original `PowerCOM HID` subdriver code (until version 0.7) sent UPS `shutdown`
 and `stayoff` commands in a wrong byte order, than what is needed by actual
