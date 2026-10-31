@@ -108,6 +108,19 @@ extern size_t interrupt_size;
 /* ---------------------------------------------------------------------- */
 
 /*
+ * HIDGetRawReport
+ * -------------------------------------------------------------------------- */
+/* Issue a raw GET_REPORT control request for report_id, up to size bytes.
+ * Unlike the path/data driven accessors below, this does not require the
+ * Report Descriptor to declare the report: some firmware keeps live readings
+ * in RAM windows that are only reachable this way (and whose content shifts
+ * between report IDs, so callers should anchor on content, not on offsets).
+ * Returns the number of bytes received, or <=0 on failure.
+ */
+int HIDGetRawReport(hid_dev_handle_t udev, const int report_id,
+	char *buf, const int size);
+
+/*
  * HIDGetItemValue
  * -------------------------------------------------------------------------- */
 int HIDGetItemValue(hid_dev_handle_t udev, const char *hidpath, double *Value, usage_tables_t *utab);

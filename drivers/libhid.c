@@ -503,6 +503,38 @@ int HIDGetDataValue(hid_dev_handle_t udev, HIDData_t *hiddata, double *Value, ti
 	return 1;
 }
 
+/* Retrieve a raw report by ID, without consulting the Report Descriptor.
+ * See declaration in libhid.h for the rationale.
+ */
+int HIDGetRawReport(hid_dev_handle_t udev, const int report_id, char *buf, const int size)
+{
+	int	ret;
+
+	if (udev == HID_DEV_HANDLE_CLOSED || buf == NULL || size <= 0) {
+		return -1;
+	}
+
+	if ((uintmax_t)size > (uintmax_t)USB_CTRL_CHARBUFSIZE_MAX) {
+		upsdebugx(3, "%s: requested size %d exceeds %s, refusing",
+			__func__, size, "USB_CTRL_CHARBUFSIZE_MAX");
+		return -1;
+	}
+
+	ret = comm_driver->get_report(udev, report_id,
+		(usb_ctrl_charbuf)buf, (usb_ctrl_charbufsize)size);
+
+	if (ret <= 0) {
+		upsdebugx(4, "%s: GET_REPORT id=0x%02x size=%d failed (%d)",
+			__func__, report_id, size, ret);
+		return (ret < 0) ? ret : -1;
+	}
+
+	upsdebugx(5, "%s: GET_REPORT id=0x%02x returned %d bytes",
+		__func__, report_id, ret);
+
+	return ret;
+}
+
 /* Return the physical value associated with the given path.
  * return 1 if OK, 0 on fail, -errno otherwise (ie disconnect).
  */
