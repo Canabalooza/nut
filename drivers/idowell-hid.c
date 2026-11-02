@@ -31,7 +31,11 @@
 #include "usb-common.h"
 #include "hidparser.h" /* for FindObject_with_ID_Node() */
 
-#define IDOWELL_HID_VERSION	"iDowell HID 0.26"
+#define IDOWELL_HID_VERSION	"iDowell HID 0.27"
+/* v0.27 GoldenMate: hold the last confirmed dead-outputs amendments
+ *       (battery.runtime 0, no OL) through cycles where the vendor
+ *       status block is transiently unreadable, so the firmware's
+ *       post-cutoff restart tries cannot slip OL back into ups.status */
 /* v0.26 GoldenMate: read the live status block that this firmware only
  *       exposes through undeclared HID reports, through the
  *       idowell_hid_aux_vendor_block hook set */
@@ -436,6 +440,12 @@ static int idowell_fix_report_desc(HIDDevice_t *pDev, HIDDesc_t *pDesc_arg) {
 static const int	idowell_vendor_block_ids[] = { 0x03, 0x07, 0x0b, 0x0f };
 static int		idowell_vendor_block_lastid = -1;
 static int		idowell_vendor_block_fails = 0;
+#define IDOWELL_VB_DROP_AFTER		3
+/* Last output-dead state we could actually measure, kept for the
+ * cycles where the block happens to be unreadable: its amendments must
+ * not lapse into the firmware's online lie (seen as one-sample OL
+ * glitches when the unit re-tries a restart after cutting out). */
+static int		idowell_vb_last_dead = 0;
 
 #define IDOWELL_VB_BUFLEN	256
 #define IDOWELL_VB_LINELEN	96
@@ -631,7 +641,7 @@ static int idowell_update_vendor_block(void)
 
 	if (nfields < 6) {
 		/* Do not keep publishing figures we can no longer confirm */
-		if (++idowell_vendor_block_fails >= 3) {
+		if (++idowell_vendor_block_fails >= IDOWELL_VB_DROP_AFTER) {
 			upsdebugx(2, "%s: vendor status block not readable for %d "
 				"polls in a row, dropping the variables it fed",
 				__func__, idowell_vendor_block_fails);
@@ -705,6 +715,7 @@ static int idowell_update_vendor_block(void)
 	 * cut out with the wall unplugged. Flag it always; letting it amend
 	 * ups.status is opt-in (see idowell_vendor_block_status). */
 	dstate_setinfo("experimental.idowell.output.dead", "%d", (f3 < 1.0) ? 1 : 0);
+	idowell_vb_last_dead = (f3 < 1.0) ? 1 : 0;
 	if (f3 < 1.0) {
 		rc |= IDOWELL_VB_OUTPUT_DEAD;
 	}
@@ -790,6 +801,19 @@ static void idowell_vendor_block_updateinfo(void)
 	vb = idowell_update_vendor_block();
 
 	if (!(vb & IDOWELL_VB_OK)) {
+		/* A transient GET_REPORT failure must not hand the floor back
+		 * to the firmware's online lie: while the block still counts
+		 * as readable (before the drop threshold), keep re-applying
+		 * the amendments from the last confirmed measurement. */
+		if (idowell_vendor_block_amend_status && idowell_vb_last_dead
+			&& idowell_vendor_block_fails < IDOWELL_VB_DROP_AFTER) {
+			upsdebugx(2, "%s: vendor status block unreadable this "
+				"cycle (%d in a row), still applying the last "
+				"confirmed dead-outputs measurements",
+				__func__, idowell_vendor_block_fails);
+			dstate_setinfo("battery.runtime", "0");
+			idowell_amend_status_string();
+		}
 		return;
 	}
 
